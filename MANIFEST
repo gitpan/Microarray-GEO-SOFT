@@ -1,0 +1,10 @@
+MANIFEST
+Makefile.PL
+lib/Microarray/GEO/SOFT.pm
+lib/Microarray/GEO/SOFT/GDS.pm
+lib/Microarray/GEO/SOFT/GPL.pm
+lib/Microarray/GEO/SOFT/GSE.pm
+lib/Microarray/GEO/SOFT/GSM.pm
+t/00basic.t
+t/01gzip.t
+META.yml                                 Module meta-data (added by MakeMaker)

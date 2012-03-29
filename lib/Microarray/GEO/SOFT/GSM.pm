@@ -1,20 +1,13 @@
 package Microarray::GEO::SOFT::GSM;
 
-# 解析SOFT文件
-# 读取GSM部分，只读取文件中从读取位置开始的第一个GSM记录
-
 # parse SOFT file
 # get the GSM part, only the first record of GSM from the current position to read
 
-use List::Vectorize;
+use List::Vectorize qw(!table);
+use Carp;
 use strict;
 
-require Microarray::GEO::SOFT;
-our @ISA = ("Microarray::GEO::SOFT");
-
-
-$| = 1;
-
+use base "Microarray::GEO::SOFT";
 
 1;
 
@@ -24,10 +17,10 @@ sub new {
 	my $invocant = shift;
 	my $class = ref($invocant) || $invocant;
 	my $self = { "file" => "",
+	             "verbose" => 1,
+				 "sample_value_column" => "VALUE",
 	             @_ };
 	bless($self, $class);
-	
-	$self->set_class("GSM");
 	
 	return $self;
 	
@@ -38,61 +31,69 @@ sub parse {
 	my $self = shift;
 	
 	my $fh;
-	if(! is_glob_ref($self->{file})) {
+	if(! List::Vectorize::is_glob_ref($self->{file})) {
 	
-		open F, $self->{file} or die "cannot open $self->{file}.\n";
+		open F, $self->{file} or croak "cannot open $self->{file}.\n";
 		$fh = \*F;
-		
-		$self->{file} = $fh;
+	}
+	else {
+		$fh = $self->{file};
 	}
 	
-	$self->parse_sample($self->{file});
+	$self->_parse_sample($fh);
 	
 	return 1;
 }
 
-sub parse_sample {
+sub _parse_sample {
 
 	my $self = shift;
 
 	my $fh = shift;
 	
+	Microarray::GEO::SOFT::_set_fh($self->{verbose});
+	
 	my $accession;
 	my $title;
 	my $platform;
-	my $field_explain;
 	my $table_colnames = [];
 	my $table_rownames = [];
-	my $table_matrix;
-	
-	my $_TMP_SOFT_DIR = $self->soft_dir;
-	
+	my $table_matrix = [];
+
 	while(my $line = <$fh>) {
 		
 		chomp $line;
 		if($line =~/^!Sample_geo_accession = (GSM\d+)$/) {
 			$accession = $1;
-			;
 		}
 		
-		if($line =~/^!Sample_title = (.*?)$/) {
+		elsif($line =~/^!Sample_title = (.*?)$/) {
 			$title = $1;
 		}
 		
-		if($line =~/^!Sample_platform_id = (GPL\d+)$/) {
+		elsif($line =~/^!Sample_platform_id = (GPL\d+)$/) {
 			$platform = $1;
 		}
 		
-		if($line =~/^#(.*?) = (.*?)$/) {
-			$field_explain->{$1} = $2;
-		}
-		
-		if($line =~/^!sample_table_begin$/) {
+		elsif($line =~/^!sample_table_begin$/) {
 			
 			$line = <$fh>;
 			chomp $line;
 			
-			@$table_colnames = split "\t", $line;
+			@$table_colnames = split "\t", $line, -1;
+			shift(@$table_colnames);
+			
+			my $value_index = -1;
+			for(my $i = 0; $i < len($table_colnames); $i ++) {
+				if($table_colnames->[$i] eq $self->{sample_value_column}) {
+					$value_index = $i;
+					last;
+				}
+			}
+			
+			if($value_index == -1) {
+				croak "ERROR: Cannot find sample value column ($self->{sample_value_column}).";
+			}
 			
 			while($line = <$fh>) {
 			
@@ -101,17 +102,18 @@ sub parse_sample {
 				}
 			
 				chomp $line;
-				my @tmp = split "\t", $line;
+				my @tmp = split "\t", $line, -1;
 				
 				my $uid = shift(@tmp);
 				
 				push(@$table_rownames, $uid);
-				# 第一列为VALUE
-				push(@$table_matrix, [$tmp[0]]);
+				# one column matrix
+				push(@$table_matrix, [$tmp[$value_index]]);
 			}
 			
 			
 		}
+		
 		if($line =~/^!sample_table_end$/) {
 			last;
 		}
@@ -122,28 +124,25 @@ sub parse_sample {
 	my $n_col = len($table_colnames);
 	
 	print "Sample info:\n";
-	print "Accession: $accession\n";
-	print "Platform: $platform\n";
-	print "Title: $title\n";
-	print "Rows: $n_row\n";
-	print "Columns: $n_col\n";
-	print "Sorting UIDs...\n";
+	print "  Accession: $accession\n";
+	print "  Platform: $platform\n";
+	print "  Title: $title\n";
+	print "  Rows: $n_row\n";
+	print "  Columns: $n_col\n";
 	print "\n";
 	
-	my $table_rownames_sorted = sort_array($table_rownames, sub {$_[0] cmp $_[1]});
-	my $table_rownames_sorted_index = order($table_rownames, sub {$_[0] cmp $_[1]});
-	my $table_matrix_sorted = subset($table_matrix, $table_rownames_sorted_index);
-		
-	open OUT, ">$_TMP_SOFT_DIR/$accession.tab";
-	for(my $i = 0; $i < len($table_matrix_sorted); $i ++) {
-		print OUT join "\t", @{$table_matrix_sorted->[$i]};
-		print OUT "\n";
-	}
-	close OUT;
+	#my $table_rownames_sorted = sort_array($table_rownames, sub {$_[0] cmp $_[1]});
+	#my $table_rownames_sorted_index = order($table_rownames, sub {$_[0] cmp $_[1]});
+	#my $table_matrix_sorted = subset($table_matrix, $table_rownames_sorted_index);
 	
-	$self->set_meta($accession, $title, $platform, $field_explain);
-	$self->set_table($table_rownames_sorted, $table_colnames, undef);
+	$self->set_meta( accession => $accession,
+	                 title     => $title,
+					 platform  => $platform );
+	$self->set_table( rownames => $table_rownames,
+	                  colnames => $table_colnames,
+					  matrix   => $table_matrix );
 	
+	Microarray::GEO::SOFT::_set_to_std_fh();
 	
 	return $self;
 
@@ -171,7 +170,6 @@ Microarray::GEO::SOFT::GSM - GEO sample data class
   $gsm->meta;
   $gsm->platform;
   $gsm->title;
-  $gsm->field;
   $gsm->accession;
   
   # the sample data is a matrix (in fact it is a vector)
@@ -183,42 +181,68 @@ Microarray::GEO::SOFT::GSM - GEO sample data class
 
 =head1 DESCRIPTION
 
-This module retrieves sample information from microarray data. The module is used
-within parsing GSE data.
+A Sample record describes the conditions under which an individual Sample was handled, 
+the manipulations it underwent, and the abundance measurement of each element derived 
+from it. Each Sample record is assigned a unique and stable GEO accession number (GSMxxx).
+ A Sample entity must reference only one Platform and may be included in multiple Series.
+(Copyed from GEO web site).
+
+This module retrieves sample information from series data.
 
 =head2 Subroutines
 
 =over 4
 
-=item C<new("file" = $file)>
+=item C<new("file" =E<gt> $file, "verbose" => 1, 'sample_value_column' => 'VALUE')>
 
-Initial a GSM class object. The only argument is the path of the microarray data in SOFT format
-or a file handle that has been openned.
+Initial a GSM class object. The first argument is the path of the sample data in SOFT format
+or a file handle that has been openned. 'verbose' determines whether
+print the message when analysis. 'sample_value_column' is the column name for
+table data when parsing GSM data.
 
 =item C<$gsm-E<gt>parse>
 
-Retrieve sample information from microarray data. The sample data in SOFT format
-is alawys a table
+Retrieve sample information. The sample data in SOFT format is alawys a table
 
 =item C<$gsm-E<gt>meta>
 
 Get meta information
 
+=item C<$gsm-E<gt>set_meta(HASH)>
+
+Set meta information. Valid argumetns are 'accession', 'title' and 'platform'.
+
+=item C<$gsm-E<gt>table>
+
+Get table information
+
+=item C<$gsm-E<gt>set_table>
+
+Set table information. Valid argumetns are 'rownames', 'colnames', 'colname_explain' and 'matrix'.
+
 =item C<$gsm-E<gt>platform>
 
-Get accession number of the platform
+Accession number for the platform the sample belong to.
 
 =item C<$gsm-E<gt>title>
 
-Title of the platform record
-
-=item C<$gsm-E<gt>field>
-
-Description of each field in the data matrix
+Title of the series record
 
 =item C<$gsm-E<gt>accession>
 
 Accession number for the sample
+
+=item C<$gsm-E<gt>rownames>
+
+primary ID for probes
+
+=item C<$gsm-E<gt>colnames>
+
+C<['VALUE']>
+
+=item C<$gsm-E<gt>matrix>
+
+expression value matrix. It is a one column matrix here.
 
 =back
 

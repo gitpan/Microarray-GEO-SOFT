@@ -1,101 +1,161 @@
 package Microarray::GEO::SOFT;
 
-# 解析SOFT文件
+use List::Vectorize qw(!table);
 
-use List::Vectorize;
+use Microarray::ExprSet;
+use File::Basename;
+use LWP::UserAgent;
+use Time::HiRes qw(usleep gettimeofday);
+use Carp;
+use Cwd;
+use strict;
+
 require Microarray::GEO::SOFT::GPL;
 require Microarray::GEO::SOFT::GSM;
 require Microarray::GEO::SOFT::GDS;
 require Microarray::GEO::SOFT::GSE;
-use Microarray::ExprSet;
 
-
-use File::Basename;
-use LWP::UserAgent;
-use Thread;
-use threads::shared;
-use Time::HiRes qw(usleep);
-
-use strict;
-
-our @ISA = qw();
-
-our $VERSION = "0.10";
+our $VERSION = "0.20";
+our $wd = getcwd();
 
 $| = 1;
 
 # download geo files
 our $ua;
 our $response;
-
-
-# 创建临时文件夹
-our $_TMP_SOFT_DIR = ".tmp_soft";
-opendir DIR, $_TMP_SOFT_DIR and closedir DIR
-	or mkdir $_TMP_SOFT_DIR;
+our $download_start_time;
+our $fh_out;
 
 1;
 
-#END {
-#	rmtree($_TMP_SOFT_DIR);
-#}
-	
 sub new {
 
 	my $invocant = shift;
 	my $class = ref($invocant) || $invocant;
 	my $self = { "file" => "",
+	             "tmp_dir" => ".tmp_soft",
+				 "verbose" => 1,
+				 "sample_value_column" => "VALUE",
 	             @_ };
 	bless($self, $class);
+	
+	opendir DIR, $self->{tmp_dir} and closedir DIR
+		or mkdir $self->{tmp_dir};
+
 	return $self;
 	
 }
 
-sub soft_dir {
-	return $_TMP_SOFT_DIR;
+sub _set_to_null_fh {
+
+	my $null = $^O eq "MSWin32" ? "NUL" : "/dev/null";
+	open my $fh_out, ">", $null;
+	$| = 1;
+	select($fh_out);
 }
 
-# 返回相应的子类
+sub _set_to_std_fh {
+	$| = 1;
+	select(STDOUT);
+}
+
+sub _set_fh {
+	my $verbose = shift;
+	
+	$verbose ? _set_to_std_fh() : _set_to_null_fh();
+}
+
+BEGIN {
+	
+	no strict 'refs';
+	
+	for my $accessor (qw(meta table)) {
+		*{$accessor} = sub {
+			my $self = shift;
+			return defined($self->{$accessor}) ? $self->{$accessor}
+			                                   : undef;
+		}
+	}
+	
+	for my $accessor (qw(accession title platform)) {
+		*{$accessor} = sub {
+			my $self = shift;
+			return defined($self->{meta}->{$accessor}) ? $self->{meta}->{$accessor}
+			                                           : undef;
+		}
+	}
+	
+	for my $accessor (qw(rownames colnames colnames_explain matrix)) {
+		*{$accessor} = sub {
+			my $self = shift;
+			return defined($self->{table}->{$accessor}) ? $self->{table}->{$accessor}
+			                                            : undef;
+		}
+	}
+	
+}
+
+sub soft_dir {
+
+	my $self = shift;
+	return $self->{tmp_dir};
+}
+
 sub parse {
 
 	my $self = shift;
 	
-	my $type = check_type($self->{file});
+	_set_fh($self->{verbose});
+	
+	# decompress file
+	if( -e $self->{file} and (! -T $self->{file}) ) {
+		$self->{file} = _decompress($self->{file});
+	}
+
+	my $type = _check_type($self->{file});
 	
 	my $obj;
 	if($type eq "SERIES") {
 	
-		$obj = Microarray::GEO::SOFT::GSE->new(file => $self->{file});
+		$obj = Microarray::GEO::SOFT::GSE->new(file => $self->{file}, 
+		                                       verbose => $self->{verbose},
+											   sample_value_column => $self->{sample_value_column},
+											   @_);
 		$obj->parse;
 		
 	}
 	elsif($type eq "DATASET") {
 		
-		$obj = Microarray::GEO::SOFT::GDS->new(file => $self->{file});
+		$obj = Microarray::GEO::SOFT::GDS->new(file => $self->{file}, 
+		                                       verbose => $self->{verbose},
+											   @_);
 		$obj->parse;
 		
 	}
 	elsif($type eq "PLATFORM") {
 		
-		$obj = Microarray::GEO::SOFT::GPL->new(file => $self->{file});
+		$obj = Microarray::GEO::SOFT::GPL->new(file => $self->{file}, 
+		                                       verbose => $self->{verbose},
+											   @_);
 		$obj->parse;
 	}
 	else {
 	
-		die "Format not supported.\n";
+		croak "ERROR: Format not supported. Only GSExxx, GDSxxx and GPLxxx are valid\n";
 		
 	}
+	
+	_set_to_std_fh();
 	
 	return $obj;
 }
 
-# 读取soft文件的前几行来判断是属于哪一种id
-# 从而返回相应的类
-sub check_type {
+# determine what type is the input file by reading first few lines
+sub _check_type {
 
 	my $file = shift;
 		
-	open F, $file or die "Cannot open $file.\n";
+	open F, $file or croak "Cannot open $file.\n";
 	
 	while(my $line = <F>) {
 	
@@ -110,280 +170,63 @@ sub check_type {
 		elsif($line =~/^\^PLATFORM /) {
 			return "PLATFORM";
 		}
+		
+		elsif($line =~/^\^Annotation/) {
+			return "PLATFORM";
+		}
 	}
 	
 	return undef;
 }
 
-# 获得meta数据
-sub meta {
-	
-	my $self = shift;
-	
-	return $self->{meta};
 
-}
-
-# 设置meta
 sub set_meta {
 
 	my $self = shift;
+	my $arg = {'accession' => $self->accession,
+	           'title'     => $self->title,
+			   'platform'  => $self->platform,
+			   @_};
 	
-	my $accession = shift;
-	my $title = shift;
-	my $platform = shift;
-	my $field = shift;
-	
-	$self->{meta}->{accession} = $accession;
-	$self->{meta}->{title} = $title;
-	$self->{meta}->{platform} = $platform;
-	$self->{meta}->{field} = $field;
-
-	return 1;
-}
-
-sub class {
-
-	my $self = shift;
-	
-	return $self->{class};
-}
-
-sub set_class {
-
-	my $self = shift;
-	
-	my $class = shift;
-	
-	$self->{class} = $class;
-	
-	return 1;
-	
-}
-
-# GSE的list
-# 包括GPL_list和GSM_list
-sub list {
-
-	my $self = shift;
-	my $type = shift;
-	
-	if($self->class() ne "GSE") {
-		die "only GSE is allowed.\n";
-	}
-	
-	if($type ne "GPL" and $type ne "GSM") {
-		die "wrong type in GSE list.\n";
-	}
-	
-	return $self->{$type."_list"};
-
-}
-
-sub set_list {
-
-	my $self = shift;
-	
-	my $list = shift;
-	my $type = shift;
-	
-	if($self->class() ne "GSE") {
-		die "only GSE is allowed.\n";
-	}
-	
-	if($type ne "GPL" and $type ne "GSM") {
-		die "wrong type in GSE list (GPL|GSM).\n";
-	}
-	
-	$self->{$type."_list"} = $list;
-	
-	return 1;
-}
-
-sub rownames {
-	
-	my $self = shift;
-	
-	my $class = $self->class();
-	
-	if($class eq "GPL" or $class eq "GSM" or $class eq "GDS") {
-		return $self->{table}->{table_rownames};
-	}
-	else {
-		die "only GPL|GSM is allowed.\n";
-	}
-}
-
-sub set_rownames {
-
-	my $self = shift;
-	my $new_rownames = shift;
-	
-	if(len($self->{table}->{table_rownames}) != len($new_rownames)) {
-		die "length of new rownames should be equal to the old rownames.\n";
-	}
-	
-	$self->{table}->{table_rownames} = $new_rownames;
-	
-	return 1;
-}
-
-sub colnames {
-	
-	my $self = shift;
-	
-	my $class = $self->class();
-	
-	if($class eq "GPL" or $class eq "GSM" or $class eq "GDS") {
-		return $self->{table}->{table_colnames};
-	}
-	else {
-		die "only GPL|GSM is allowed.\n";
-	}
-}
-
-sub set_colnames {
-
-	my $self = shift;
-	my $new_colnames = shift;
-	
-	if(len($self->{table}->{table_colnames}) != len($new_colnames)) {
-		die "length of new colnames should be equal to the old colnames.\n";
-	}
-	
-	$self->{table}->{table_colnames} = $new_colnames;
-	
-	return 1;
-}
-
-
-sub matrix {
-	
-	my $self = shift;
-	
-	my $class = $self->class;
-	if($class eq "GPL") {
-		return $self->{table}->{table_matrix};
-	}
-	elsif($class eq "GSM" or $class eq "GDS") {
-		my $accession = $self->accession;
-		open F, "$_TMP_SOFT_DIR/$accession.tab" or die "cannot open $_TMP_SOFT_DIR/$accession.tab\n";
-		
-		my $matrix;
-		while(my $line = <F>) {
-			chomp $line;
-			my @tmp = split "\t", $line;
-			push(@$matrix, [@tmp]);
-		}
-		
-		return $matrix;
-	}
-	else {
-		die "wrong parameter\n";
-	}
-}
-
-sub accession {
-
-	my $self = shift;
-	
-	return $self->{meta}->{accession};
-
-}
-
-sub title {
-
-	my $self = shift;
-	
-	return $self->{meta}->{title};
-
-}
-
-sub field {
-
-	my $self = shift;
-	
-	return $self->{meta}->{field};
-
-}
-
-sub platform {
-
-	my $self = shift;
-	
-	return $self->{meta}->{platform};
-
-}
-
-# 通过GPL类来修改rownames
-# 允许修改的convert的类为GSM和GDS
-sub id_convert {
-
-	my $self = shift;
-	my $gpl = shift;
-	my $to_id = shift;
-	
-	my $class = $self->class;
-	if($class ne "GSM" and $class ne "GDS") {
-		die "id convert only permit GSM and GDS\n";
-	}
-	
-	my $platform_id = $gpl->accession;
-	my $available_field = $gpl->field;
-	
-	if(! $available_field->{$to_id}) {
-		die "wrong ID ($to_id) in $platform_id\n";
-	}
-	
-	my $new_rownames = $gpl->mapping($to_id);
-	
-	$self->set_rownames($new_rownames);
+	$self->{meta}->{"accession"} = $arg->{'accession'};
+	$self->{meta}->{"title"} = $arg->{'title'};
+	$self->{meta}->{"platform"} = $arg->{'platform'};
 	
 	return $self;
-
 }
 
-# 将soft类转变为exprset类
-# 可以转的类为GSM和GDS
-sub soft2exprset {
+
+sub set_table {
 
 	my $self = shift;
+	my $arg = {'rownames'         => $self->rownames,
+	           'colnames'         => $self->colnames,
+			   'colnames_explain' => $self->colnames_explain,
+			   'matrix'           => $self->matrix,
+			   @_};
 	
-	my $class = $self->class;
-	if($class ne "GSM" and $class ne "GDS") {
-		die "convert only permit GSM and GDS\n";
-	}
+	$self->{table}->{"rownames"} = $arg->{'rownames'};
+	$self->{table}->{"colnames"} = $arg->{'colnames'};
+	$self->{table}->{"colnames_explain"} = $arg->{'colnames_explain'};
+	$self->{table}->{"matrix"} = $arg->{'matrix'};
 	
-	my $eset = Microarray::ExprSet->new;
-	$eset->set_feature($self->rownames);
-	
-	# phenotype 应该是每个GSM的title
-	if($class eq "GSM") {
-		$eset->set_phenotype([$self->title]);
-	}
-	elsif($class eq "GDS") {
-		$eset->set_phenotype(sapply($self->colnames, sub{$self->field->{$_[0]}}));
-	}
-	
-	$eset->set_matrix($self->matrix);
-	
-	return $eset;
-	
+	return $self;
 }
 
-
-
-
-
-
-
-# 完整的从geo上下载数据
-# 返回下载到本地的文件列表(数组索引)
+# download data from GEO ftp
+# returns a list of filenames (array reference)
+# in most circumstance, there is only one file at each series/platform/gds directory
+# but still there is probability that multiple files locate in directory (especially for series matrix format)
+# we only deal with one file situation
+# for multiple files situation, users can downloaded manually
+# and initial this object with file argument
 sub download {
 
 	my $self = shift;
 	
 	my $id = shift;
+	
+	_set_fh($self->{verbose});
 	
 	my %option = ( "proxy" => "",        # proxy setting, only http, should be like "http://username:password@127.0.0.1:808/"
 				   "timeout" => 30,
@@ -392,7 +235,9 @@ sub download {
 	my $remote_file_list;
 	my $remote_file_name;
 	my $remote_file_size;
-	my $local_file_name;
+	my $local_file;
+	
+	#$fh_out = _open_out_handle($self->{verbose});
 	
 	$ua = LWP::UserAgent->new;
 	$ua->timeout($option{timeout});
@@ -403,34 +248,36 @@ sub download {
 	
 	my $url;
 	
-	# 不同类型数据的url格式
+	# different geo data type
 	my $url_format = { "gse" => "ftp://ftp.ncbi.nih.gov/pub/geo/DATA/SOFT/by_series",
-					   "gpl" => "ftp://ftp.ncbi.nih.gov/pub/geo/DATA/SOFT/by_platform",
+					   "gpl" => "ftp://ftp.ncbi.nih.gov/pub/geo/DATA/annotation/platforms",
 					   "gds" => "ftp://ftp.ncbi.nih.gov/pub/geo/DATA/SOFT/GDS" };
-	
-	my $chip_file_format = lc($option{"format"});
-	
-	# 根据不同的芯片格式选择url
+
+	# format url based on different GEO id type
 	if($id =~/^gse\d+$/i) {
 		$url = "$url_format->{gse}/$id";
 	}
 	elsif($id =~/^gpl\d+$/i) {
-		$url = "$url_format->{gpl}/$id";
+		$url = "$url_format->{gpl}";
 	}
 	elsif($id =~/^gds\d+$/i) {
-		$url = "$url_format->{gds}/$id";
+		$url = "$url_format->{gds}";
+	}
+	else {
+		croak "ERROR: GEO ID should look like 'GSE123', 'GPL123' and 'GDS123'";
 	}
 	
-	# 如果是GSE或者GPL
-	if($id =~/^gse\d+$/i or $id =~/gpl\d+$/i) {
+	# if GSE or GPL
+	if($id =~/^gse\d+$/i) {
 		
-		# 先获得目录下的文件，因为某些GSE或者GPL文件下会有多个文件
+		# first get the file list in the directory
+		# because some GSE or GPL term would have more than one file
 		print "Reading dir from GEO FTP site:\n";
 		print "  $url\n\n";
 		$response = $ua->get($url);
 		
 		unless($response->is_success) {
-			die $response->status_line;
+			croak $response->status_line;
 		}
 		
 		my $content = $response->content;
@@ -438,100 +285,124 @@ sub download {
 		
 		print "found ", scalar(@$remote_file_list), " file.\n";
 		
-		for(my $i = 0; $i < scalar(@$remote_file_list); $i ++) {
-			my @tmp = split " ", $remote_file_list->[$i];
-			push(@$remote_file_name, $tmp[$#tmp]);
-			push(@$remote_file_size, $tmp[4]);
-			push(@$local_file_name, "$_TMP_SOFT_DIR/$tmp[$#tmp]");
+		if(scalar(@$remote_file_list) > 1) {
+			croak "ERROR: There are more than one files in the remote directory and this ".
+			      "situation has not been supported by ". __PACKAGE__." by this version. ".
+				  "But still you can download them by hand.";
+		}
+		if(! scalar(@$remote_file_list)) {
+			croak "Can not find any file.";
 		}
 		
-		foreach (@$remote_file_name) {
-			print "  $_\n";
-		}
+		my @tmp = split " ", $remote_file_list->[0];
+		$remote_file_name = $tmp[$#tmp];
+		$remote_file_size = $tmp[4];
+		$local_file = $self->soft_dir."/$tmp[$#tmp]";
+		
+		print "remote file is: $remote_file_name\n";
 		print "\n";
-	} # 如果是GDS数据
+		
+	}
+	elsif($id =~/gpl\d+$/i) {
+	
+		print "Validating link from GEO FTP site:\n";
+		print "  $url/$id.annot.gz\n";
+		$response = $ua->head("$url/$id.annot.gz");
+		
+		unless($response->is_success) {
+			croak $response->status_line;
+		}
+		
+		print "found $id.annot.gz on the server.\n\n";
+		$remote_file_name = "$id.annot.gz";
+		$remote_file_size = $response->header("content-length");
+		$local_file = $self->soft_dir."/$id.annot.gz";
+		
+	}
+	# if GDS
 	elsif($id =~/gds\d+$/i) {
-		print "validating link from GEO FTP site:\n";
+	
+		print "Validating link from GEO FTP site:\n";
 		print "  $url/$id.soft.gz\n\n";
 		$response = $ua->head("$url/$id.soft.gz");
 		
 		unless($response->is_success) {
-			die $response->status_line;
+			croak $response->status_line;
 		}
 		
 		print "found $id.soft.gz on the server.\n\n";
-		$remote_file_name->[0] = "$id.soft.gz";
-		$remote_file_size->[0] = $response->header("content-length");
-		$local_file_name->[0] = "$_TMP_SOFT_DIR/$id.soft.gz";
+		$remote_file_name = "$id.soft.gz";
+		$remote_file_size = $response->header("content-length");
+		$local_file = $self->soft_dir."/$id.soft.gz";
 		
 	}
 	
-	for(my $i = 0; $i < scalar(@$remote_file_name); $i ++) {
-		my $local_file = "$_TMP_SOFT_DIR/$remote_file_name->[$i]";
+	# whether there already has a file with the same name
+	while(-e $local_file) {
+		my $r = int(rand(100000));
+		if($remote_file_name =~/^(.*?)\.(\S+)$/) {
+			my $base = $1;
+			my $ext = $2;
+			$local_file = $self->soft_dir."/$base.$r.$ext";
+		}
+		else {
+			$local_file = $self->soft_dir."/$remote_file_name.$r";
+		}
+	}
+	
+	$url = "$url/$remote_file_name";
+	print "downloading $url\n";
+	print "file size: $remote_file_size byte.\n";
+	print "local file: $wd/$local_file\n\n";
+	
+	# begin to download
+	# if thread supported, progress would be shown
+	$response = undef;
+	
+	eval 'require Thread; require threads::shared';
+	
+	if($@) {
+		_download($url, $local_file);
 		
-		# 检查当地文件夹中是否有同名文件
-		if(-e $local_file) {
-			my $r = int(rand(10000000000));
-			if($remote_file_name->[$i] =~/^(.*?)\.(\S+)$/) {
-				my $base = $1;
-				my $ext = $2;
-				$local_file = "$_TMP_SOFT_DIR/$base.$r.$ext";
-			}
-			else {
-				$local_file = "$_TMP_SOFT_DIR/$remote_file_name->[$i].$r";
-			}
-			
-			$local_file_name->[$i] = $local_file;
+		unless($response->is_success) {
+			croak $response->status_line;
 		}
 		
-		$url = "$url/$remote_file_name->[$i]";
-		print "downloading $url\n";
-		print "file size: $remote_file_size->[$i] byte.\n";
-		print "local file: $local_file\n\n";
-		
-		# 开始下载，并显示下载进度
-		$response = undef;
+	} else {
+		eval q`
 		my $response : shared;
+		$download_start_time = gettimeofday();
+		my $download_start_time : shared;
 		my $f1 = Thread->new(\&_download, $url, $local_file);
-		my $f2 = Thread->new(\&_progress, $local_file, $remote_file_size->[$i]);
+		my $f2 = Thread->new(\&_progress, $local_file, $remote_file_size);
 		
 		$f1->join;
 		$f2->join;
-		
+		`;
 	}
 	
-	my $local_uncompressed_file_name;
-	foreach my $f (@$local_file_name) {
-		my $fn = _decompress($f);
-		push(@$local_uncompressed_file_name, $fn);
-	}
+	$self->{file} = $local_file;
 	
-	# 原先设计还可以洗在series matrix (目录下可能会有超过一个的文件)
-	$self->{file} = $local_uncompressed_file_name->[0];
-	return 1;
+	_set_to_std_fh();
+	
+	return $self;
 }
 
-# 下载
 sub _download {
 	my $url = shift;
 	my $local_file = shift;
 		
 	$response = $ua->get($url, ":content_file" => $local_file);	
-
 }
 
-# 显示下载进度
 sub _progress {
 	my $local_file = shift;
 	my $remote_file_size = shift;
 	
-	my $s_sleep = 1000000;
-	my $s_sleep_ms = int($s_sleep / 1000);
-	
-	# 一开始文件可能正在连接中，还未开始下载
+	# still connecting
 	while(! -e $local_file) {
 		#print "$local_file does not exist, sleep $s_sleep_ms ms.\n";
-		usleep($s_sleep);
+		usleep(500000);
 		
 		if($response) {
 			print "\n\n";
@@ -545,47 +416,49 @@ sub _progress {
 	while($recieved_file_size != $remote_file_size) {
 		$recieved_file_size = -s "$local_file";
 		my $percentage = $recieved_file_size / $remote_file_size;
-		
 		$percentage = sprintf("%.1f", $percentage * 100);
+		my $speed = $recieved_file_size / (gettimeofday - $download_start_time);
+		$speed = sprintf("%.2f", $speed / 1024);  #KB/s
+		my $passed_time = (gettimeofday - $download_start_time);
+		$passed_time = int($passed_time);
 		print "\b" x 100;
-		
-		
+
 		print "[", $bar->[$i % scalar(@$bar)], "]";
-		print " Recieving $recieved_file_size byte. $percentage\%";
+		print " Recieving $recieved_file_size byte.\t$percentage\%\t$speed KB/s\t$passed_time"."s";
 		$i ++;
 		
-		usleep(1000);
+		usleep(500000);
 		
-		# 如果下载完毕
+		# if download is done
 		if($response) {
 			last;
 		}
 	}
 	
 	print "\n\n";
+
 }
 
 
-# 解压缩
 sub _decompress {
 	
 	# 压缩文件
 	my $compressed_file = shift;
 	
-	my $version = `gzip --version`;
-	unless($version =~/gzip/im) {
-		die "You need to install gzip and put the path of gzip into you PATH envirionment variable.\n";
-	}
-	
+	my $null = $^O eq "MSWin32" ? "NUL" : "/dev/null";
+	eval("system('gzip --version > $null')") == 0
+		or croak "ERROR: Cannot find 'gzip'\n";
+
 	# 压缩文件的文件名
 	my $basename = basename($compressed_file);
 	
-	print "decompress $compressed_file.\n";
+	print "decompress $compressed_file...\n";
 	my $command;
 	
 	# 获得解压缩文件的文件名
 	$command = "gzip -l \"$compressed_file\"";
 	my $status = `$command`;
+	
 	my @foo = split "\n", $status;
 	@foo = split " ", $foo[1];
 	my $uncompressed_file = $foo[$#foo];
@@ -593,15 +466,12 @@ sub _decompress {
 	# 解压缩
 	$command = "gzip -cd \"$compressed_file\" > \"$uncompressed_file\"";
 	
-	$status = `$command`;
-	if($status) {
-		die "$status\n";
-	}
+	system($command) == 0
+		or croak "ERROR: $!\n";
 	
 	# 返回解压后的文件名
 	return "$uncompressed_file";
 }
-
 
 
 __END__
@@ -613,68 +483,102 @@ __END__
 Microarray::GEO::SOFT - Reading microarray data in SOFT format from GEO database.
 
 =head1 SYNOPSIS
-
+  
   use Microarray::GEO::SOFT;
   use strict;
   
   # initialize
   my $soft = Microarray::GEO::SOFT->new; 
-  
+
   # download
-  $soft->download("GSE19513");
-  $soft->download("GPL6793");
   $soft->download("GDS3718");
+  $soft->download("GSE10626");
+  $soft->download("GPL1261");
   
   # or else you can read local data
-  $soft = Microarray::GEO::SOFT->new(file => "GSE19513.soft");
+  $soft = Microarray::GEO::SOFT->new(file => "GDS3718.soft");
+  $soft = Microarray::GEO::SOFT->new(file => "GSE10626_family.soft");
+  $soft = Microarray::GEO::SOFT->new(file => "GPL1261.annot");
   
   # parse
-  # $data would be a object of Microarray:GEO::SOFT::GSE, Microarray::GEO::SOFT::GPL
-  # or Microarray::GEO::SOFT::GDS class
+  # it returns a  Microarray::GEO::SOFT::GDS,
+  # Microarray::GEO::SOFT::GSE or Microarray::GEO::SOFT::GPL object
+  # according the the GSE ID type
   my $data = $soft->parse;
   
-  # meta info
+  # some meta info
   $data->meta;
   $data->title;
   $data->platform;
-  $data->field;
   
-  # GPL belongs to GSE
-  my $gpl = $data->list("GPL")->[0];
+  # for GPL and GDS, you can get the data table
+  $data->table;
+  $data->colnames;
+  $data->rownames;
+  $data->matrix;
   
-  # merge GSMs belonging to a same GPL into a whole
-  my $g = $data->merge->[0];
+  # sinece GSE can contain more than one GPL
+  # we can get the GPL list in a GSE
+  my $gpl_list = $data->list("GPL");
   
-  # transform the uid from probe id to gene symbol
-  $g->id_convert($gpl, "Gene Symbol");
+  # merge samples belonging to a same GPL into a data set
+  my $gds_list = $data->merge;
   
-  # transform into Microarray::ExprSet class object
+  # if the GSE only have one platform
+  # then the merged data set is the first one in gds_list
+  # and the platform is the first one in gpl_list
+  my $g = $gds_list->[0];
+  my $gpl = $gpl_list->[0];
+  
+  # since GPL data contains different mapping of genes or probes
+  # we can transform from probe id to gene symbol
+  # it returns a Microarray::ExprSet object
+  my $e = $g->id_convert($gpl, "Gene Symbol");
+  my $e = $g->id_convert($gpl, qr/gene[-_\s]?symbol/i);
+  
+  
+  # if you pased a GDS data
+  # you can first find the platform
+  my $platform_id = $data->platform;
+  # downloaded or parse the local file
+  my $gpl = Microarray::GEO::SOFT->new->download($platform_id);
+  # and do the id convert thing
+  my $e = $data->id_convert($gpl, qr/gene[-_\s]?symbol/i);
+  
+  # or just transform into Microarray::ExprSet direct from GDS
   my $e = $g->soft2exprset;
   
+  # then you can do some simple processing thing
   # eliminate the blank lines
-  $e->remove_empty_feature;
+  $e->remove_empty_features;
   
   # make all symbols unique
-  $e->unique_feature;
+  $e->unify_features;
   
   # obtain the expression matrix
-  $e->matrix;	
+  $e->save('some-file');	
+
+Also, you can use the module under command line
+
+  getgeo --id=GDS3718
+  getgeo --file=GDS3718.soft --verbose
 
 =head1 DESCRIPTION
 
 GEO (Gene Expression Omnibus) is the biggest database providing gene expression
 profile data. This module provides method to download and parse files in GEO database
-and transform them into format for common usage.
+and transform them into simple format for common usage.
 
 There are always four type of data in GEO which are GSE, GPL, GSM and GDS.
 
-GPL: Platform of the microarray, like Affymetrix U133A
+GPL: Platform of the microarray, like Affymetrix U133A, see L<Microarray::GEO::SOFT::GPL>
 
-GSM: A single microarray
+GSM: A single microarray, see L<Microarray::GEO::SOFT::GSM>
 
-GSE: A complete microarray experiment, always contains multi GSMs and multi GPLS
+GSE: A complete microarray experiment, always contains multiple samples and multiple platforms
+see L<Microarray::GEO::SOFT::GSE>
 
-GDS: manually collected data sets from GSE, only 1 platform
+GDS: manually collected data sets from GSE, with only 1 platform. see L<Microarray::GEO::SOFT::GDS>
 
 Data stored in GEO database has several formats. We provide method to parse the most
 used format: SOFT formatted family files. The origin data is downloaded from GEO ftp site.
@@ -683,55 +587,133 @@ used format: SOFT formatted family files. The origin data is downloaded from GEO
 
 =over 4
 
-=item C<new("file" = $file)>
+=item C<new("file" =E<gt> $file, HASH )>
 
-Initial a Microarray::GEO::SOFT class object. The only argument is file path for 
-the microarray data in SOFT format or a file handle that has been openned.
+Initial a Microarray::GEO::SOFT class object. The argument is file path for 
+the microarray data in SOFT format or a file handle that has been openned. Other
+arguments are.
 
-=item C<$soft-E<gt>download(ACC, %options>
+  'tmp_dir'             => '.tmp_soft'
+  'verbose'             => 1
+  'sample_value_column' => 'VALUE'
+
+'tmp_dir' is the name for the temporary directory. 'verbose' determines whether
+print the message when analysis. 'sample_value_column' is the column name for
+table data when parsing GSM data.
+  
+=item C<$soft-E<gt>download(ACC, %options)>
 
 Download GEO record from NCBI website. The first argument is the accession number
 such as (GSExxx, GPLxxx or GDSxxx). Your can set the timeout and proxy via C<%options>.
-the proxy should be set as http://username:password@server-addr:port.
+the proxy should be set as http://username:password@server-addr:port/.
+
+GSE data is downloaded from ftp://ftp.ncbi.nih.gov/pub/geo/DATA/SOFT/by_series/GSExxx/GSExxx_family.tar.gz
+
+GDS data is downloaded from ftp://ftp.ncbi.nih.gov/pub/geo/DATA/SOFT/GDS/GDSxxx.soft.gz
+
+GPL data is downloaded from ftp://ftp.ncbi.nih.gov/pub/geo/DATA/annotation/platforms/GPLxxx.annot.gz
+
+=item C<$soft-E<gt>soft_dir>
+
+Temp dir for storing downloaded GEO data. It is ".tmp_soft".
 
 =item C<$soft-E<gt>parse>
 
 Proper parsing method is selected according to the accession number of GEO record.
 E.g. if a GSExxx record is required, then the parsing function would choose method
-to parse GSExxx part and return a C<Microarray::GEO::SOFT::GSE> class object.
+to parse GSExxx part and return a L<Microarray::GEO::SOFT::GSE> class object. The
+return value is one of L<Microarray::GEO::SOFT::GSE>, L<Microarray::GEO::SOFT::GPL>
+or L<Microarray::GEO::SOFT::GDS> object.
 
 =item C<$data-E<gt>meta>
 
 Get meta information, more detailed meta information can be get via C<platform>, 
-C<title>, C<field>, C<accession>.
+C<title>, C<accession>.
+
+=item C<$data-E<gt>set_meta(HASH)>
+
+Set meta information, arguments are 'platform', 'title' and 'accession'
 
 =item C<$data-E<gt>platform>
 
 Get accession number of the platform. If a record has multiple platforms, the function
-return a reference of array.
+return a reference of array (only for GSE).
 
 =item C<$data-E<gt>title>
 
 Title of the record
 
-=item C<$data-E<gt>field>
-
-Description of each field in the data matrix
-
 =item C<$data-E<gt>accession>
 
 Accession number for the record
 
-=item C<$gds-E<gt>id_convert($gpl, id)>
+=item C<$gds-E<gt>table>
 
-Change the primary id for genes which always the rownames by default. Mapping information
-is provided in GPL record. The first argument is the GPL record corresponding to 
-the GDS record, the id argument is from colnames in the GPL record. Use 
-C<$gpl->>field> or C<$gpl->>colnames> to find the ID names to convert.
+Get the table part in the object. Note it is not work for L<Microarray::GEO::SOFT::GSE> object.
 
-=item C<$gds-E<gt>soft2exprset>
+=item C<$gds-E<gt>set_table>
 
-Transform C<Microarray::GEO::SOFT> class object to C<Microarray::ExprSet> class object.
+Set the table part in the object. Note it is not work for L<Microarray::GEO::SOFT::GSE> object.
+
+=item C<$gds-E<gt>rownames>
+
+Row names for the table part in the object. Note it is not work for L<Microarray::GEO::SOFT::GSE> object.
+
+=item C<$gds-E<gt>colnames>
+
+Column names for the table part in the object. Note it is not work for L<Microarray::GEO::SOFT::GSE> object.
+
+=item C<$gds-E<gt>colnames_explain>
+
+A little more detailed explain for column names. Note it is not work for L<Microarray::GEO::SOFT::GSE> object.
+
+=item C<$gds-E<gt>matrix>
+
+Expression value matrix or ID mapping matrix.  Note it is not work for L<Microarray::GEO::SOFT::GSE> object.
+
+=item C<getgeo>
+
+C<getgeo> is a simple command line tool to download or parse the GEO data.
+Options are as follows:
+
+  --id=[GEOID]
+
+    GEO ID. such as GSE123, GDS123 or GPL123. If this is set, the script would
+    download data from GEO FTP site.
+
+  --proxy=[PROXY]
+
+    Proxy to connect to GEO FTP site. Format should look like
+    http://username:password@host:port/.
+
+  --file=[FILE]
+
+    Filename for local GEO file. If --id is set, this option is ignored.
+
+  --tmp-dir=[DIR]
+
+    Temporary directory name for processing of GEO data. By default it is
+    '.tmp_soft' in your working directory.
+
+  --verbose
+
+    Whether print message while processing.
+
+  --sample-value-column=[FIELD]
+
+    Since there may be multiple columns in GSM record, users may specify which
+    column is the expression value they want. By default it is 'VALUE'. Ignored
+        when analyzing GPL and GDS data.
+
+  --output-file=[FILE]
+
+    Filename for the output file. By default it is 'GEOID.table' in your current
+
+    working directory.
+
+  --help
+
+    Help message.
 
 =back
 
@@ -749,6 +731,6 @@ at your option, any later version of Perl 5 you may have available.
 
 =head1 SEE ALSO
 
-L<Microarray::ExprSets>
+L<Microarray::ExprSet>
 
 =cut

@@ -1,21 +1,15 @@
 package Microarray::GEO::SOFT::GSE;
 
-# 解析SOFT文件
-
-use List::Vectorize;
-use Microarray::GEO::SOFT::GPL;
-use Microarray::GEO::SOFT::GSM;
-use Microarray::GEO::SOFT::GDS;
+use List::Vectorize qw(!table);
+require Microarray::GEO::SOFT::GPL;
+require Microarray::GEO::SOFT::GSM;
+require Microarray::GEO::SOFT::GDS;
+use Carp;
 use strict;
 
-require Microarray::GEO::SOFT;
-our @ISA = ("Microarray::GEO::SOFT");
+use base "Microarray::GEO::SOFT";
 
-
-$| = 1;
-
-# 全局的文件句柄
-our $fh;
+our $GDS_MERGE = 0;
 
 1;
 
@@ -24,11 +18,11 @@ sub new {
 	my $invocant = shift;
 	my $class = ref($invocant) || $invocant;
 	my $self = { "file" => "",
+	             "verbose" => 1,
+				 "sample_value_column" => 'VALUE',
 	             @_ };
 	bless($self, $class);
-	
-	$self->set_class("GSE");
-	
+
 	return $self;
 	
 }
@@ -38,34 +32,34 @@ sub parse {
 	my $self = shift;
 	
 	my $fh;
-	if(! is_glob_ref($self->{file})) {
+	if(! List::Vectorize::is_glob_ref($self->{file})) {
 	
-		open F, $self->{file} or die "cannot open $self->{file}.\n";
+		open F, $self->{file} or croak "cannot open $self->{file}.\n";
 		$fh = \*F;
-		
-		$self->{file} = $fh;
+	}
+	else {
+		$fh = $self->{file};
 	}
 	
-	$self->parse_series($self->{file});
+	$self->_parse_series($fh);
 	
-	return 1;
+	return $self;
 }
 
-# 解析series
-sub parse_series {
+sub _parse_series {
 
 	my $self = shift;
 
 	my $fh = shift;
-	my $using_sqlite = shift;
+	
+	Microarray::GEO::SOFT::_set_fh($self->{verbose});
 	
 	my $accession;
 	my $title;
 	my $platform;
 	
 	my $series;
-	my $field_explain;
-	
+
 	my $gpl_list;
 	my $gsm_list;
 	
@@ -85,24 +79,27 @@ sub parse_series {
 			push(@$platform, $1);
 		}
 		
-		# platfrom 信息
+		# platform part in the file
 		elsif($line =~/^\^PLATFORM = (GPL\d+)$/) {
 		
-			$fh = back_to_last_line($fh, length($line));
+			$fh = _back_to_last_line($fh, length($line));
 			
-			# 返回GEO::GPL对象
-			my $gpl = Microarray::GEO::SOFT::GPL->new(file => $fh);
+			# it is a GPL object
+			my $gpl = Microarray::GEO::SOFT::GPL->new(file => $fh,
+			                                          verbose => $self->{verbose});
 			$gpl->parse;
 			
 			push(@$gpl_list, $gpl);
 		}
-		
+		# sample part in the file
 		elsif($line =~/^\^SAMPLE = (GSM\d+)$/) {
 		
-			$fh = back_to_last_line($fh, length($line));
+			$fh = _back_to_last_line($fh, length($line));
 			
-			# 返回SOFT::GSM对象
-			my $gsm = Microarray::GEO::SOFT::GSM->new(file => $fh);
+			# it is a GSM object
+			my $gsm = Microarray::GEO::SOFT::GSM->new(file => $fh,
+			                                          verbose => $self->{verbose},
+													  sample_value_column => $self->{sample_value_column});
 			$gsm->parse;
 			
 			push(@$gsm_list, $gsm);
@@ -114,62 +111,25 @@ sub parse_series {
 	my $n_sample = len($gsm_list);
 	
 	print "Series info:\n";
-	print "Accession: $accession\n";
-	print "Title:$title\n";
-	print "Platforms: $n_platform\n";
-	print "Samples: $n_sample\n";
+	print "  Accession: $accession\n";
+	print "  Title:$title\n";
+	print "  Platforms: $n_platform\n";
+	print "  Samples: $n_sample\n";
 	print "\n";
 	
-	$self->set_meta($accession, $title, $platform, $field_explain);
-	$self->set_list($gpl_list, "GPL");
-	$self->set_list($gsm_list, "GSM");
+	$self->set_meta( accession => $accession,
+	                 title     => $title,
+					 platform  => $platform );
+	$self->set_list("GPL" => $gpl_list,
+	                "GSM" => $gsm_list);
+	
+	Microarray::GEO::SOFT::_set_to_std_fh();
 	
 	return $self;
 }
 
-# 读取series信息
-sub read_series {
-	
-	my $fh = shift;
-	
-	my $accession;
-	my $sample_id = [];
-	my $platform_id = [];
-	
-	while(my $line = <$fh>) {
-	
-		chomp $line;
-		
-		# 当series记录结束
-		if($line =~/^\^/) {
-		
-			$fh = back_to_last_line($fh, length($line));
-			last;
-		}
-		
-		if($line =~/^!Series_geo_accession = (GSE\d+)$/) {
-			$accession = $1;
-		}
-		elsif($line =~/^!Series_sample_id = (GSM\d+)$/) {
-			push(@$sample_id, $1);
-		}
-		elsif($line =~/^!Series_platform_id = (GPL\d+)$/) {
-			push(@$platform_id, $1);
-		}
-	}
-	
-	my $res;
-	$res->{accession} = $accession;
-	$res->{platform_id} = $platform_id;
-	$res->{sample_id} = $sample_id;
-	
-	return $res;
-}
 
-
-
-# 回到上一行的开头
-sub back_to_last_line {
+sub _back_to_last_line {
 	
 	my $fh = shift;
 	my $current_line_length = shift;
@@ -180,129 +140,135 @@ sub back_to_last_line {
 	return $fh;
 }
 
-# 把相同platform合并为matrix
-# 返回一个GDS的数组
+sub set_list {
+
+	my $self = shift;
+	
+	my $arg = {'GPL' => $self->list('GPL'),
+	           'GSM' => $self->list('GSM'),
+			   @_};
+	
+	$self->{"GPL_list"} = $arg->{'GPL'};
+	$self->{"GSM_list"} = $arg->{'GSM'};
+	
+	return $self;
+}
+
+sub list {
+	
+	my $self = shift;
+	my $type = shift;
+	
+	if($type ne 'GPL' and $type ne 'GSM') {
+		croak "ERROR $type is not a valid paramter. Permitted argumetns are GPL and GSM.";
+	}
+	
+	return defined($self->{$type.'_list'}) ? $self->{$type.'_list'}
+	                                       : undef ;
+
+}
+
+# override these method inherited from SUPER class
+BEGIN {
+	
+	no strict 'refs';
+
+	for my $accessor (qw(table rownames colnames colnames_explain matrix set_table)) {
+		*{$accessor} = sub {
+			croak "Method '".$accessor."' is not supported by ".__PACKAGE__." because a series can contain more than one platforms\n";
+		}
+	}
+}
+
+# merge samples under same platform as a matrix
+# this is what is called GDS
+# since some series contain more than one platforms
+# thus, this function returns a GDS object array reference
 sub merge {
 		
 	my $self = shift;
 	
-	my $gse_platform = $self->platform;
-	my $gds;
+	my $gpl_list = $self->platform;
+	my $gds_list;
 	
-	for(my $i = 0; $i < len($gse_platform); $i ++) {
+	for(my $i = 0; $i < len($gpl_list); $i ++) {
 	
 		my $sample_list = $self->list("GSM");
 		
-		# $s 是
-		my $s = subset($sample_list, sub {$_[0]->platform eq $gse_platform->[$i]} );
+		# list of GSMs with same platform
+		my $s = subset($sample_list, sub {$_[0]->platform eq $gpl_list->[$i]} );
 		
-		my $g = Microarray::GEO::SOFT::GDS->new;
-		$g->merge_gsm($s);
+		my $g = $self->_merge_gsm($s);
 
-		push(@$gds, $g);
+		push(@$gds_list, $g);
 	}
 	
-	return $gds;
+	return $gds_list;
 	
 }
 
-
-# 把若干个相同platform的GSM合并为一个GDS
-# 虽然不是GEO上定义的GDS (manually assembled)
-# 但是数据格式相同
-sub merge_gsm {
+sub _merge_gsm {
 
 	my $self = shift;
 	
 	my $gsm_list = shift;
 	
-	# 检查gpl号是否都一样
+	Microarray::GEO::SOFT::_set_fh($self->{verbose});
+	
+	# check whether these samples share same platform
 	my $gpl_list = sapply($gsm_list, sub {$_[0]->platform});
 	if(len(unique($gpl_list)) != 1) {
-		die "Platform should be same\n";
+		croak "ERROR: Platform should be same\n";
 	}
 	
-	my $r = sample(c(["0".."9"], ["A".."Z"]), 20, "replace" => 1);
-	my $accession = "GDS_".(join "", @$r);
-	my $title = "gsm_merged";
+	# virtual GDS has a long accession number
+	$GDS_MERGE ++;
+	my $accession = "GDS_merge_$GDS_MERGE"."_from_".$self->accession;
+	my $title = "merged from ".$self->accession." under ".$gpl_list->[0];
 	my $platform = $gpl_list->[0];
-	my $field_explain;
 	my $table_colnames;
+	my $table_colnames_explain;
 	
 	for(my $i = 0; $i < len($gsm_list); $i ++) {
-	
-		$field_explain->{$gsm_list->[$i]->accession} = $gsm_list->[$i]->title;
+
 		$table_colnames->[$i] = $gsm_list->[$i]->accession;
+		$table_colnames_explain->[$i] = $gsm_list->[$i]->title;
 		
 	}
 
 	my $table_rownames = $gsm_list->[0]->rownames;
 	
-	# 把数据存入文本文件中
-	my $_TMP_SOFT_DIR = $self->soft_dir;
-	open OUT, ">$_TMP_SOFT_DIR/$accession.tab" or die "cannot open $_TMP_SOFT_DIR/$accession.tab\n";
-	
-	# 首先初始化文件句柄
-	my $fh;
+	my $table_matrix = [[]];
 	for(my $i = 0; $i < len($gsm_list); $i ++) {
-		local *F;
-		$fh->[$i] = *F;
-		
-		my $acc = $gsm_list->[$i]->accession;
-		open F, "$_TMP_SOFT_DIR/$acc.tab" or die "cannot open $_TMP_SOFT_DIR/$acc.tab\n";
-		
-	}
-	
-	# 写入数据
-	my $flag = 0;
-	while(1) {
-		for(my $i = 0; $i < len($gsm_list); $i ++) {
-			
-			my $handle = $fh->[$i];
-			my $line = <$handle>;
-			
-			if($line) {
-				chomp $line;
-				my @tmp = split "\t", $line;
-				
-				$i == len($gsm_list) - 1 ? print OUT "$tmp[0]\n"
-										 : print OUT "$tmp[0]\t";
-			}
-			else {
-				$flag = 1;
-			}
+		for(my $j = 0; $j < len($table_rownames); $j ++) {
+			$table_matrix->[$j]->[$i] = $gsm_list->[$i]->matrix->[$j]->[0];
 		}
-		
-		if($flag) {
-			last;
-		}
-	
 	}
-	
-	# 关闭文件句柄
-	for(my $i = 0; $i < len($gsm_list); $i ++) {
-		my $handle = $fh->[$i];
-		close $handle;
-	}
-	
-	close OUT;
 	
 	
 	my $n_row = len($table_rownames);
 	my $n_col = len($table_colnames);
 	
 	print "Merge GSM into GDS:\n";
-	print "Accession: $accession\n";
-	print "Platform: $platform\n";
-	print "Title: $title\n";
-	print "Rows: $n_row\n";
-	print "Columns: $n_col\n";
+	print "  Accession: $accession\n";
+	print "  Platform: $platform\n";
+	print "  Title: $title\n";
+	print "  Rows: $n_row\n";
+	print "  Columns: $n_col\n";
 	print "\n";
 	
-	$self->set_meta($accession, $title, $platform, $field_explain);
-	$self->set_table($table_rownames, $table_colnames, undef);
+	my $gds = Microarray::GEO::SOFT::GDS->new();
+	$gds->set_meta( accession => $accession,
+	                title     => $title,
+					platform  => $platform );
+	$gds->set_table( rownames => $table_rownames,
+	                 colnames => $table_colnames,
+					 colnames_explain => $table_colnames_explain,
+					 matrix   => $table_matrix );
 	
-	return $self;
+	Microarray::GEO::SOFT::_set_to_std_fh();
+	
+	return $gds;
 }
 
 
@@ -330,7 +296,6 @@ Microarray::GEO::SOFT::GSE - GEO series data class
   $gse->meta;
   $gse->platform;
   $gse->title;
-  $gse->field;
   $gse->accession;
 	
   # since a GSE can contain more than one GSM and GPL, so the GPL and GSM stored
@@ -344,45 +309,82 @@ Microarray::GEO::SOFT::GSE - GEO series data class
 
 =head1 DESCRIPTION
 
+A Series record links together a group of related Samples and provides a focal point 
+and description of the whole study. Series records may also contain tables describing 
+extracted data, summary conclusions, or analyses. Each Series record is assigned a unique 
+and stable GEO accession number (GSExxx). (Copyed from GEO web site).
+
 This module retrieves data storing as GEO series format.
 
 =head2 Subroutines
 
 =over 4
 
-=item C<new("file" = $file)>
+=item C<new("file" =E<gt> $file, "verbose" => 1)>
 
 Initial a GSE class object. The only argument is the microarray data in SOFT format
-or a file handle that has been openned.
+or a file handle that has been openned. The argument is optional and the platform
+can be download through L<Microarray::GEO::SOFT>. 'verbose' determines whether
+print the message when analysis. 'sample_value_column' is the column name for
+table data when parsing GSM data.
 
 =item C<$gse-E<gt>parse>
 
-Retrieve series information from microarray data.
+Retrieve series information. This subroutine extracts the basic meta information and 
+the L<Microarray::GEO::SOFT::GSM> list and the L<Microarray::GEO::SOFT::GPL> list
 
 =item C<$gse-E<gt>meta>
 
 Get meta information
 
+=item C<$gse-E<gt>set_meta(HASH)>
+
+Set meta information. Valid argumetns are 'accession', 'title' and 'platform'.
+
+=item C<$gse-E<gt>table>
+
+disabled
+
+=item C<$gse-E<gt>set_table>
+
+disabled
+
 =item C<$gse-E<gt>platform>
 
-Get accession number of the platform
+Accession number for the platform the series belong to. Note here the platform is an array reference.
 
 =item C<$gse-E<gt>title>
 
-Title of the platform record
-
-=item C<$gse-E<gt>field>
-
-Description of each field in the data matrix
+Title of the series record
 
 =item C<$gse-E<gt>accession>
 
-Accession number for the platform
+Accession number for the series
+
+=item C<$gse-E<gt>rownames>
+
+disabled
+
+=item C<$gse-E<gt>colnames>
+
+disabled
+
+=item C<$gse-E<gt>colnames_explain>
+
+disabled
+
+=item C<$gse-E<gt>matrix>
+
+disabled
 
 =item C<$gse-E<gt>list("GSM" | "GPL")>
 
 Since a series can contain more than one samples and platforms. This method can
 get GSM list or GPL list that belong to the GSE record.
+
+=item C<$gse-E<gt>set_list(HASH)>
+
+Set the GSM and GPL list to GSE object. Valid arguments are 'GPL' and 'GSM'.
 
 =item C<$gse-E<gt>merge>
 
